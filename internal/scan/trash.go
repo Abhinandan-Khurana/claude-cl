@@ -31,9 +31,6 @@ func Trash(claudeDir string, s Session) (string, error) {
 		return "", err
 	}
 	name := project + "__" + filepath.Base(s.Path)
-	if fi.IsDir() {
-		name = project + "__" + s.ID
-	}
 	target := filepath.Join(dest, name)
 	if err := os.Rename(s.Path, target); err != nil {
 		return "", err
