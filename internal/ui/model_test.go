@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,17 @@ func testModel(t *testing.T) Model {
 	return m
 }
 
+func useNoColor(t *testing.T) {
+	useColorProfile(t, termenv.Ascii)
+}
+
+func useColorProfile(t *testing.T, profile termenv.Profile) {
+	t.Helper()
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(profile)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+}
+
 func TestOpensOnNewSession(t *testing.T) {
 	m := testModel(t)
 	r, ok := m.current()
@@ -92,6 +104,124 @@ func TestEnterOnSessionResumesIt(t *testing.T) {
 	}
 	if m.Choice.Session.ID != "h1" {
 		t.Errorf("resumed %q, want the first session in this directory", m.Choice.Session.ID)
+	}
+}
+
+func TestRenderingSanitizesMetadataWithoutChangingOperationalValues(t *testing.T) {
+	useNoColor(t)
+	controls := []rune{'\x1b', '\a', '\u009d'}
+	session := scan.Session{
+		ID:       "h1",
+		Cwd:      "/evil" + string(controls[0]) + "cwd" + string(controls[1]) + string(controls[2]),
+		Title:    "title" + string(controls[2]),
+		Branch:   "branch" + string(controls[0]),
+		Model:    "claude-sonnet-5",
+		Preview:  []scan.Turn{{Role: "user", Text: "preview" + string(controls[2])}},
+		Modified: time.Now(),
+	}
+	models := []string{"opus" + string(controls[0]) + string(controls[1]) + string(controls[2]), "sonnet"}
+	m := New([]scan.Session{session}, "/current"+string(controls[0])+"cwd", t.TempDir(), models)
+	m.width = 140
+	m.height = 30
+	rawSessions := append([]scan.Session(nil), m.sessions...)
+	rawModels := append([]string(nil), m.models...)
+
+	out := press(m, "down").View() // render the session path, branch, model, and preview
+	for _, control := range controls {
+		if strings.ContainsRune(out, control) {
+			t.Errorf("rendered metadata contains control rune %#U:\n%s", control, out)
+		}
+	}
+	for _, want := range []string{"evilcwd", "branch", "preview", "sonnet"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered session metadata missing %q:\n%s", want, out)
+		}
+	}
+	if !reflect.DeepEqual(m.sessions, rawSessions) || !reflect.DeepEqual(m.models, rawModels) {
+		t.Fatal("rendering changed raw operational values")
+	}
+
+	newChoice := press(m, "enter")
+	if newChoice.Choice == nil || newChoice.Choice.Model != models[0] {
+		t.Fatalf("new-session model = %+v, want raw configured model %q", newChoice.Choice, models[0])
+	}
+
+	resumed := press(m, "down", "enter")
+	if resumed.Choice == nil || !reflect.DeepEqual(resumed.Choice.Session, session) {
+		t.Fatalf("resumed session = %+v, want original %+v", resumed.Choice, session)
+	}
+}
+
+func TestRenderingSanitizesMetadataSinks(t *testing.T) {
+	useNoColor(t)
+	const esc = "\x1b"
+	cases := []struct {
+		name  string
+		want  string
+		setup func(Model) Model
+	}{
+		{
+			name: "parent title",
+			want: "fork of parent title",
+			setup: func(m Model) Model {
+				m.sessions[0].Title = "parent" + esc + " title"
+				m.rebuild()
+				return press(m, "down", "down")
+			},
+		},
+		{
+			name: "parent ID fallback",
+			want: "fork of parent",
+			setup: func(m Model) Model {
+				m.sessions[0].Title = ""
+				m.sessions[0].ID = "parent" + esc
+				m.sessions[1].ParentID = m.sessions[0].ID
+				m.rebuild()
+				return press(m, "down", "down")
+			},
+		},
+		{
+			name: "delete confirmation",
+			want: "delete",
+			setup: func(m Model) Model {
+				m.sessions[0].Title = "delete" + esc
+				m.rebuild()
+				return press(m, "down", "d")
+			},
+		},
+		{
+			name: "status",
+			want: "status",
+			setup: func(m Model) Model {
+				m.status = "status" + esc
+				return m
+			},
+		},
+		{
+			name: "command-line search query",
+			want: "search query",
+			setup: func(m Model) Model {
+				m.SetQuery("query" + esc)
+				return m
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New([]scan.Session{
+				{ID: "parent", Cwd: "/repo", Title: "parent", Modified: time.Now()},
+				{ID: "child", Cwd: "/repo", ParentID: "parent", Title: "child", Modified: time.Now()},
+			}, "/repo", t.TempDir(), []string{"opus"})
+			m.width = 140
+			m.height = 30
+			out := tc.setup(m).View()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("rendered sink missing %q:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, esc) {
+				t.Fatalf("rendered sink contains OSC introducer:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -633,6 +763,13 @@ func TestShortModel(t *testing.T) {
 	}
 }
 
+func TestSanitizeTerminalText(t *testing.T) {
+	const input = "a\nb\rc\td\x1be\af\u0085g\u009dh\x00i"
+	if got, want := sanitizeTerminalText(input), "a b c defghi"; got != want {
+		t.Errorf("sanitizeTerminalText(%q) = %q, want %q", input, got, want)
+	}
+}
+
 func TestBogusWindowSizeIgnored(t *testing.T) {
 	m := testModel(t)
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
@@ -660,7 +797,7 @@ func TestFramePaneMatchesRequestedWidth(t *testing.T) {
 }
 
 func TestLightFramePanePaintsShortRows(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.TrueColor)
+	useColorProfile(t, termenv.TrueColor)
 	applyTheme(themeLight)
 	out := framePane("short", 60, 8)
 	if !strings.Contains(out, "48;5;255") {
@@ -676,7 +813,7 @@ func TestLightFramePanePaintsShortRows(t *testing.T) {
 }
 
 func TestLightThemeDoesNotLeaveBlackRibbons(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.TrueColor)
+	useColorProfile(t, termenv.TrueColor)
 	m := testModel(t)
 	m.theme = themeLight
 	applyTheme(themeLight)
