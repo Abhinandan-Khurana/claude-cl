@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/kiraa06/claude-cl/internal/group"
+	"github.com/kiraa06/claude-cl/internal/scan"
 )
 
 // Colours are adaptive so the picker reads correctly on light and dark
@@ -265,8 +266,7 @@ func (m Model) renderRow(i, width int) string {
 	r := m.rows[i]
 	switch r.kind {
 	case rowHeader:
-		text := sanitizeTerminalText(r.text)
-		line := header.Render(text)
+		line := header.Render(r.text)
 		if r.count > 0 {
 			line += dim.Render(fmt.Sprintf("  %d", r.count))
 		}
@@ -295,19 +295,19 @@ func (m Model) renderNewRow(i, width int) string {
 
 func (m Model) renderSessionRow(i, width int) string {
 	r := m.rows[i]
-	s := r.session
+	s := r.display
 	lines := m.sessionTitleLines(i, width)
 	sel := i == m.cursor
 
 	var path string
 	if r.section != group.KindCwd {
-		path = group.Abbreviate(sanitizeTerminalText(s.Cwd))
+		path = group.Abbreviate(s.Cwd)
 	}
 	ageCell := age(s.Modified)
 	if s.Missing {
 		ageCell = "gone"
 	}
-	modelCell := sanitizeTerminalText(shortModel(s.Model))
+	modelCell := shortModel(s.Model)
 
 	cursor, tree := m.sessionPrefix(i)
 	tw, showPath := m.titleColWidth(width)
@@ -389,7 +389,7 @@ func (m Model) titleWidth(i, width int) int {
 }
 
 func (m Model) sessionTitleLines(i, width int) []string {
-	return wrapTitle(sanitizeTerminalText(m.rows[i].session.Title), m.titleWidth(i, width), titleLines)
+	return wrapTitle(m.rows[i].display.Title, m.titleWidth(i, width), titleLines)
 }
 
 func (m Model) joinCols(title, path, ageCell, modelCell string, sel, showPath bool) string {
@@ -422,15 +422,15 @@ func metaCell(text string, width int, sel bool, base lipgloss.Style) string {
 }
 
 func (m Model) parentTitle(id string) string {
-	for _, s := range m.sessions {
-		if s.ID == id {
-			if s.Title != "" {
-				return sanitizeTerminalText(s.Title)
+	for _, r := range m.rows {
+		if r.kind == rowSession && r.session.ID == id {
+			if r.display.Title != "" {
+				return r.display.Title
 			}
-			return sanitizeTerminalText(id)
+			return r.display.ID
 		}
 	}
-	return sanitizeTerminalText(id)
+	return scan.SanitizeDisplayText(id)
 }
 
 // paintTitle styles a title, highlighting query terms and dimming ancestors
@@ -511,12 +511,12 @@ func (m Model) renderPreview(width int) string {
 	}
 	r, ok := m.current()
 	if !ok || r.kind != rowSession {
-		return faint.Render("New session\n\nStarts " + m.currentTool() + " in\n" + group.Abbreviate(sanitizeTerminalText(m.cwd)))
+		return faint.Render("New session\n\nStarts " + m.currentTool() + " in\n" + group.Abbreviate(m.displayCwd))
 	}
-	s := r.session
+	s := r.display
 
 	var b strings.Builder
-	for i, line := range wrapTitle(sanitizeTerminalText(s.Title), width, 3) {
+	for i, line := range wrapTitle(s.Title, width, 3) {
 		if i == 0 {
 			b.WriteString(header.Render(line))
 		} else {
@@ -530,19 +530,19 @@ func (m Model) renderPreview(width int) string {
 		if s.Clone {
 			label = "clone of "
 		}
-		b.WriteString(faint.Render(label + clip(m.parentTitle(s.ParentID), max(width-8, 8))))
+		b.WriteString(faint.Render(label + clip(m.parentTitle(r.session.ParentID), max(width-8, 8))))
 		b.WriteString("\n")
 	}
 	if s.Missing {
 		b.WriteString(warn.Render("directory no longer exists"))
 		b.WriteString("\n")
 	}
-	b.WriteString(faint.Render(group.Abbreviate(sanitizeTerminalText(s.Cwd))))
+	b.WriteString(faint.Render(group.Abbreviate(s.Cwd)))
 	if s.Branch != "" && s.Branch != "HEAD" {
-		b.WriteString(faint.Render("  " + sanitizeTerminalText(s.Branch)))
+		b.WriteString(faint.Render("  " + s.Branch))
 	}
 	b.WriteString("\n")
-	b.WriteString(dim.Render(s.Modified.Format("Mon 2 Jan 15:04") + "  " + sanitizeTerminalText(shortModel(s.Model))))
+	b.WriteString(dim.Render(s.Modified.Format("Mon 2 Jan 15:04") + "  " + shortModel(s.Model)))
 	b.WriteString("\n\n")
 
 	if len(s.Preview) == 0 {
@@ -556,7 +556,7 @@ func (m Model) renderPreview(width int) string {
 		}
 		b.WriteString(style.Render(who))
 		b.WriteString("\n")
-		b.WriteString(dim.Render(indent(wrap(clip(sanitizeTerminalText(t.Text), 240), max(width-2, 8)), "  ")))
+		b.WriteString(dim.Render(indent(wrap(clip(t.Text, 240), max(width-2, 8)), "  ")))
 		b.WriteString("\n\n")
 	}
 	return b.String()
@@ -568,19 +568,19 @@ func (m Model) renderFooter() string {
 	if m.confirming {
 		if r, ok := m.current(); ok {
 			lines = append(lines, warn.Render("delete ")+
-				selected.Render(clip(sanitizeTerminalText(r.session.Title), 48))+
+				selected.Render(clip(r.display.Title, 48))+
 				warn.Render("?  y / n")+
 				dim.Render("  (moved to trash, not erased)"))
 		}
 	} else if m.searching {
-		lines = append(lines, accent.Render("search ")+selected.Render(sanitizeTerminalText(m.query))+marker.Render("▌"))
+		lines = append(lines, accent.Render("search ")+selected.Render(scan.SanitizeDisplayText(m.query))+marker.Render("▌"))
 	} else if m.status != "" {
-		lines = append(lines, warn.Render(sanitizeTerminalText(m.status)))
+		lines = append(lines, warn.Render(scan.SanitizeDisplayText(m.status)))
 	}
 
 	var models []string
-	for i, name := range m.models {
-		displayName := sanitizeTerminalText(name)
+	for i := range m.models {
+		displayName := m.displayModels[i]
 		if i == m.modelIdx {
 			models = append(models, marker.Render("‹ ")+selected.Render(displayName)+marker.Render(" ›"))
 			continue
@@ -598,20 +598,6 @@ func (m Model) renderFooter() string {
 	}
 	lines = append(lines, faint.Render(hints))
 	return strings.Join(lines, "\n")
-}
-
-// sanitizeTerminalText keeps untrusted display text from changing terminal state.
-func sanitizeTerminalText(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case '\n', '\r', '\t':
-			return ' '
-		}
-		if unicode.IsControl(r) {
-			return -1
-		}
-		return r
-	}, s)
 }
 
 // age renders a compact relative time: the list is scanned, not read.

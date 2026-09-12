@@ -43,28 +43,31 @@ type row struct {
 	session scan.Session
 	depth   int
 	last    bool
-	count   int  // header: sessions in this section
-	context bool // ancestor shown so a matching fork keeps its parent
+	count   int          // header: sessions in this section
+	context bool         // ancestor shown so a matching fork keeps its parent
+	display scan.Session // sanitized copy used only for rendering
 }
 
 func (r row) selectable() bool { return r.kind == rowNew || r.kind == rowSession }
 
 // Model is the picker's state.
 type Model struct {
-	sessions  []scan.Session // everything found, unfiltered
-	cwd       string
-	repoRoot  string
-	claudeDir string
-	home      string
-	tool      string
-	tools     []string // detected tool names; switcher hidden unless len>=2
+	sessions   []scan.Session // everything found, unfiltered
+	cwd        string
+	repoRoot   string
+	claudeDir  string
+	displayCwd string
+	home       string
+	tool       string
+	tools      []string // detected tool names; switcher hidden unless len>=2
 
 	rows   []row
 	cursor int
 	offset int // first visible row, for scrolling
 
-	models   []string
-	modelIdx int
+	models        []string
+	displayModels []string
+	modelIdx      int
 	// modelPinned records that the user chose a model explicitly, which stops
 	// the selection following whichever row is highlighted.
 	modelPinned bool
@@ -87,20 +90,49 @@ type Model struct {
 // New builds a picker over the given sessions.
 func New(sessions []scan.Session, cwd, claudeDir string, models []string) Model {
 	m := Model{
-		sessions:    sessions,
-		cwd:         cwd,
-		repoRoot:    group.RepoRoot(cwd),
-		claudeDir:   claudeDir,
-		models:      models,
-		showPreview: true,
-		theme:       loadTheme(),
-		width:       100,
-		height:      30,
+		sessions:      sessions,
+		cwd:           cwd,
+		repoRoot:      group.RepoRoot(cwd),
+		claudeDir:     claudeDir,
+		models:        models,
+		displayModels: sanitizeStrings(models),
+		displayCwd:    scan.SanitizeDisplayText(cwd),
+		showPreview:   true,
+		theme:         loadTheme(),
+		width:         100,
+		height:        30,
 	}
 	applyTheme(m.theme)
 	m.rebuild()
 	m.syncModelToCursor()
 	return m
+}
+
+func displaySession(s scan.Session) scan.Session {
+	display := s
+	display.ID = scan.SanitizeDisplayText(s.ID)
+	display.Cwd = scan.SanitizeDisplayText(s.Cwd)
+	display.Title = scan.SanitizeDisplayText(s.Title)
+	display.Branch = scan.SanitizeDisplayText(s.Branch)
+	display.Model = scan.SanitizeDisplayText(s.Model)
+	display.ParentID = scan.SanitizeDisplayText(s.ParentID)
+	if len(s.Preview) > 0 {
+		display.Preview = make([]scan.Turn, len(s.Preview))
+		for i, turn := range s.Preview {
+			display.Preview[i] = turn
+			display.Preview[i].Role = scan.SanitizeDisplayText(turn.Role)
+			display.Preview[i].Text = scan.SanitizeDisplayText(turn.Text)
+		}
+	}
+	return display
+}
+
+func sanitizeStrings(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = scan.SanitizeDisplayText(value)
+	}
+	return out
 }
 
 // rebuild recomputes the flattened rows from the current query, keeping the
@@ -119,7 +151,7 @@ func (m *Model) rebuild() {
 	rows := make([]row, 0, len(visible)+len(sections)+2)
 	for _, sec := range sections {
 		hdr := len(rows)
-		rows = append(rows, row{kind: rowHeader, text: sec.Label(), section: sec.Kind})
+		rows = append(rows, row{kind: rowHeader, text: scan.SanitizeDisplayText(sec.Label()), section: sec.Kind})
 		if sec.Kind == group.KindCwd {
 			rows = append(rows, row{kind: rowNew, text: "New session", section: sec.Kind})
 		}
@@ -129,6 +161,7 @@ func (m *Model) rebuild() {
 			rows = append(rows, row{
 				kind:    rowSession,
 				session: n.Session,
+				display: displaySession(n.Session),
 				section: sec.Kind,
 				depth:   n.Depth,
 				last:    n.Last,
@@ -139,7 +172,7 @@ func (m *Model) rebuild() {
 		if sec.Hidden > 0 {
 			rows = append(rows, row{
 				kind:    rowNote,
-				text:    plural(sec.Hidden, "more session") + " — press / to search",
+				text:    scan.SanitizeDisplayText(plural(sec.Hidden, "more session") + " — press / to search"),
 				section: sec.Kind,
 			})
 		}
@@ -483,6 +516,7 @@ func (m *Model) cycleTool() {
 		m.status = ""
 	}
 	m.models = tool.Models(next, m.home)
+	m.displayModels = sanitizeStrings(m.models)
 	m.modelIdx = 0
 	m.modelPinned = false
 	m.cursor = 0
