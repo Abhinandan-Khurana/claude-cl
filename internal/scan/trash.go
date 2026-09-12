@@ -31,9 +31,6 @@ func Trash(claudeDir string, s Session) (string, error) {
 		return "", err
 	}
 	name := project + "__" + filepath.Base(s.Path)
-	if fi.IsDir() {
-		name = project + "__" + s.ID
-	}
 	target := filepath.Join(dest, name)
 	if err := os.Rename(s.Path, target); err != nil {
 		return "", err
@@ -45,7 +42,8 @@ func Trash(claudeDir string, s Session) (string, error) {
 	// Subagent transcripts live in a sibling directory named for the session.
 	if sidecar := strings.TrimSuffix(s.Path, ".jsonl"); sidecar != s.Path {
 		if fi, err := os.Stat(sidecar); err == nil && fi.IsDir() {
-			if err := os.Rename(sidecar, filepath.Join(dest, project+"__"+s.ID)); err != nil {
+			target := filepath.Join(dest, project+"__"+filepath.Base(sidecar))
+			if err := os.Rename(sidecar, target); err != nil {
 				return target, fmt.Errorf("transcript trashed, subagents left behind: %w", err)
 			}
 		}

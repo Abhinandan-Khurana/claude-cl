@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -58,10 +59,34 @@ func testModel(t *testing.T) Model {
 	m := New(sessions, "/repo/backend", t.TempDir(), []string{"opus[1m]", "opus", "sonnet", "haiku", "fable"})
 	m.repoRoot = "/repo" // set directly; the test dirs are not real repositories
 	m.theme = themeDark
-	applyTheme(themeDark)
+	useTheme(t, themeDark)
 	m.rebuild()
 	m.cursor = m.firstSelectable()
 	return m
+}
+
+func useNoColor(t *testing.T) {
+	useColorProfile(t, termenv.Ascii)
+}
+
+func useColorProfile(t *testing.T, profile termenv.Profile) {
+	t.Helper()
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(profile)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+}
+
+func useTheme(t *testing.T, name string) {
+	t.Helper()
+	previous := struct {
+		dim, faint, header, title, selected, marker, accent, warn, aiMark, paneBorder, canvas lipgloss.Style
+		canvasBg                                                                              lipgloss.TerminalColor
+	}{dim, faint, header, title, selected, marker, accent, warn, aiMark, paneBorder, canvas, canvasBg}
+	applyTheme(name)
+	t.Cleanup(func() {
+		dim, faint, header, title, selected, marker, accent, warn, aiMark, paneBorder, canvas = previous.dim, previous.faint, previous.header, previous.title, previous.selected, previous.marker, previous.accent, previous.warn, previous.aiMark, previous.paneBorder, previous.canvas
+		canvasBg = previous.canvasBg
+	})
 }
 
 func TestOpensOnNewSession(t *testing.T) {
@@ -92,6 +117,129 @@ func TestEnterOnSessionResumesIt(t *testing.T) {
 	}
 	if m.Choice.Session.ID != "h1" {
 		t.Errorf("resumed %q, want the first session in this directory", m.Choice.Session.ID)
+	}
+}
+
+func TestRenderingSanitizesMetadataWithoutChangingOperationalValues(t *testing.T) {
+	useNoColor(t)
+	controls := []rune{'\x1b', '\a', '\u009d', '\u202e', '\u200b', '\ufeff', '\u00ad', '\u2028', '\u2029', '\v', '\f'}
+	hostile := string(controls)
+	session := scan.Session{
+		ID:       "h1",
+		Cwd:      "/evil" + hostile + "cwd",
+		Title:    "title" + hostile,
+		Branch:   "branch" + hostile,
+		Model:    "claude-sonnet-5",
+		Preview:  []scan.Turn{{Role: "user", Text: "preview" + hostile}},
+		Modified: time.Now(),
+	}
+	models := []string{"opus" + hostile, "sonnet"}
+	m := New([]scan.Session{session}, "/current"+hostile+"cwd", t.TempDir(), models)
+	m.width = 140
+	m.height = 30
+	rawSessions := make([]scan.Session, len(m.sessions))
+	for i, session := range m.sessions {
+		rawSessions[i] = session
+		rawSessions[i].Preview = append([]scan.Turn(nil), session.Preview...)
+	}
+	rawModels := append([]string(nil), m.models...)
+
+	out := press(m, "down").View() // render the session path, branch, model, and preview
+	for _, control := range controls {
+		if strings.ContainsRune(out, control) {
+			t.Errorf("rendered metadata contains control rune %#U:\n%s", control, out)
+		}
+	}
+	for _, want := range []string{"evil  cwd", "branch", "preview", "sonnet"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered session metadata missing %q:\n%s", want, out)
+		}
+	}
+	if !reflect.DeepEqual(m.sessions, rawSessions) || !reflect.DeepEqual(m.models, rawModels) {
+		t.Fatal("rendering changed raw operational values")
+	}
+
+	newChoice := press(m, "enter")
+	if newChoice.Choice == nil || newChoice.Choice.Model != models[0] {
+		t.Fatalf("new-session model = %+v, want raw configured model %q", newChoice.Choice, models[0])
+	}
+
+	resumed := press(m, "down", "enter")
+	if resumed.Choice == nil || !reflect.DeepEqual(resumed.Choice.Session, session) {
+		t.Fatalf("resumed session = %+v, want original %+v", resumed.Choice, session)
+	}
+}
+
+func TestRenderingSanitizesMetadataSinks(t *testing.T) {
+	useNoColor(t)
+	const esc = "\x1b"
+	cases := []struct {
+		name  string
+		want  string
+		setup func(Model) Model
+	}{
+		{
+			name: "parent title",
+			want: "fork of parent title",
+			setup: func(m Model) Model {
+				m.sessions[0].Title = "parent" + esc + " title"
+				m.rebuild()
+				return press(m, "down", "down")
+			},
+		},
+		{
+			name: "parent ID fallback",
+			want: "fork of parent",
+			setup: func(m Model) Model {
+				m.sessions[0].Title = ""
+				m.sessions[0].ID = "parent" + esc
+				m.sessions[1].ParentID = m.sessions[0].ID
+				m.rebuild()
+				return press(m, "down", "down")
+			},
+		},
+		{
+			name: "delete confirmation",
+			want: "delete target",
+			setup: func(m Model) Model {
+				m.sessions[0].Title = "delete target" + esc
+				m.rebuild()
+				return press(m, "down", "d")
+			},
+		},
+		{
+			name: "status",
+			want: "status",
+			setup: func(m Model) Model {
+				m.status = "status" + esc
+				return m
+			},
+		},
+		{
+			name: "command-line search query",
+			want: "search query",
+			setup: func(m Model) Model {
+				m.SetQuery("query" + esc)
+				return m
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New([]scan.Session{
+				{ID: "parent", Cwd: "/repo", Title: "parent", Modified: time.Now()},
+				{ID: "child", Cwd: "/repo", ParentID: "parent", Title: "child", Modified: time.Now()},
+			}, "/repo", t.TempDir(), []string{"opus"})
+			m.width = 140
+			m.height = 30
+			out := tc.setup(m).View()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("rendered sink missing %q:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, esc) {
+				t.Fatalf("rendered sink contains OSC introducer:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -346,7 +494,7 @@ func TestAITitleDotStaysInTitleColumn(t *testing.T) {
 		Modified: time.Now(),
 	}}, "/repo/backend", t.TempDir(), []string{"opus"})
 	m.theme = themeDark
-	applyTheme(themeDark)
+	useTheme(t, themeDark)
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	out := tm.(Model).View()
 	if !strings.Contains(out, "short title") || !strings.Contains(out, "·") {
@@ -361,7 +509,7 @@ func TestAITitleDotStaysInTitleColumn(t *testing.T) {
 func TestColumnHeaderFitsOnOneLine(t *testing.T) {
 	m := testModel(t)
 	m.theme = themeLight
-	applyTheme(themeLight)
+	useTheme(t, themeLight)
 	inner := 80
 	hdr := m.renderColumnHeader(inner)
 	if strings.Contains(hdr, "\n") {
@@ -480,7 +628,7 @@ func TestForkMarkAtEndOfNestedTitle(t *testing.T) {
 		{ID: "child", Cwd: "/repo/backend", Title: "forked chat", ParentID: "parent", Modified: time.Now().Add(-time.Hour)},
 	}, "/repo/backend", t.TempDir(), []string{"opus"})
 	m.theme = themeDark
-	applyTheme(themeDark)
+	useTheme(t, themeDark)
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	out := tm.(Model).View()
 	if !strings.Contains(out, "└─ ") && !strings.Contains(out, "├─ ") {
@@ -531,7 +679,7 @@ func TestViewDoesNotOverflowWidth(t *testing.T) {
 	for _, theme := range []string{themeDark, themeLight} {
 		m := testModel(t)
 		m.theme = theme
-		applyTheme(theme)
+		useTheme(t, theme)
 		tm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 32})
 		out := tm.(Model).View()
 		for i, line := range strings.Split(out, "\n") {
@@ -566,7 +714,7 @@ func TestThemeToggleDarkLight(t *testing.T) {
 	t.Setenv("CL_THEME", "")
 	m := testModel(t)
 	m.theme = themeDark
-	applyTheme(m.theme)
+	useTheme(t, m.theme)
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	m = tm.(Model)
 	if !strings.Contains(m.View(), "theme dark") {
@@ -644,7 +792,7 @@ func TestBogusWindowSizeIgnored(t *testing.T) {
 }
 
 func TestFramePaneMatchesRequestedWidth(t *testing.T) {
-	applyTheme(themeDark)
+	useTheme(t, themeDark)
 	for _, outer := range []int{60, 98, 140} {
 		out := framePane(strings.Repeat("─", outer-4), outer, 6)
 		var widest int
@@ -660,8 +808,8 @@ func TestFramePaneMatchesRequestedWidth(t *testing.T) {
 }
 
 func TestLightFramePanePaintsShortRows(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.TrueColor)
-	applyTheme(themeLight)
+	useColorProfile(t, termenv.TrueColor)
+	useTheme(t, themeLight)
 	out := framePane("short", 60, 8)
 	if !strings.Contains(out, "48;5;255") {
 		t.Fatal("light pane padding must use the white canvas background")
@@ -676,10 +824,10 @@ func TestLightFramePanePaintsShortRows(t *testing.T) {
 }
 
 func TestLightThemeDoesNotLeaveBlackRibbons(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.TrueColor)
+	useColorProfile(t, termenv.TrueColor)
 	m := testModel(t)
 	m.theme = themeLight
-	applyTheme(themeLight)
+	useTheme(t, themeLight)
 	m.AttachTools(t.TempDir(), "codex", []string{"claude", "grok", "codex"})
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 24})
 	out := tm.(Model).View()
@@ -708,7 +856,7 @@ func TestClampOffsetShrinksWhenWindowGrows(t *testing.T) {
 	}
 	m := New(sessions, "/repo/backend", t.TempDir(), []string{"opus"})
 	m.theme = themeDark
-	applyTheme(themeDark)
+	useTheme(t, themeDark)
 	m.rebuild()
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 14})
 	m = press(tm.(Model), "G")
@@ -735,7 +883,7 @@ func TestListShowsMoreIndicators(t *testing.T) {
 	}
 	m := New(sessions, "/repo/backend", t.TempDir(), []string{"opus"})
 	m.theme = themeDark
-	applyTheme(themeDark)
+	useTheme(t, themeDark)
 	m.rebuild()
 	tm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 14})
 	m = tm.(Model)

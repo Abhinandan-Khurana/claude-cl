@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/kiraa06/claude-cl/internal/group"
+	"github.com/kiraa06/claude-cl/internal/scan"
 )
 
 // Colours are adaptive so the picker reads correctly on light and dark
@@ -294,7 +295,7 @@ func (m Model) renderNewRow(i, width int) string {
 
 func (m Model) renderSessionRow(i, width int) string {
 	r := m.rows[i]
-	s := r.session
+	s := r.display
 	lines := m.sessionTitleLines(i, width)
 	sel := i == m.cursor
 
@@ -388,7 +389,7 @@ func (m Model) titleWidth(i, width int) int {
 }
 
 func (m Model) sessionTitleLines(i, width int) []string {
-	return wrapTitle(m.rows[i].session.Title, m.titleWidth(i, width), titleLines)
+	return wrapTitle(m.rows[i].display.Title, m.titleWidth(i, width), titleLines)
 }
 
 func (m Model) joinCols(title, path, ageCell, modelCell string, sel, showPath bool) string {
@@ -421,15 +422,15 @@ func metaCell(text string, width int, sel bool, base lipgloss.Style) string {
 }
 
 func (m Model) parentTitle(id string) string {
-	for _, s := range m.sessions {
-		if s.ID == id {
-			if s.Title != "" {
-				return s.Title
+	for _, r := range m.rows {
+		if r.kind == rowSession && r.session.ID == id {
+			if r.display.Title != "" {
+				return r.display.Title
 			}
-			return id
+			return r.display.ID
 		}
 	}
-	return id
+	return scan.SanitizeDisplayText(id)
 }
 
 // paintTitle styles a title, highlighting query terms and dimming ancestors
@@ -510,9 +511,9 @@ func (m Model) renderPreview(width int) string {
 	}
 	r, ok := m.current()
 	if !ok || r.kind != rowSession {
-		return faint.Render("New session\n\nStarts " + m.currentTool() + " in\n" + group.Abbreviate(m.cwd))
+		return faint.Render("New session\n\nStarts " + m.currentTool() + " in\n" + group.Abbreviate(m.displayCwd))
 	}
-	s := r.session
+	s := r.display
 
 	var b strings.Builder
 	for i, line := range wrapTitle(s.Title, width, 3) {
@@ -529,7 +530,7 @@ func (m Model) renderPreview(width int) string {
 		if s.Clone {
 			label = "clone of "
 		}
-		b.WriteString(faint.Render(label + clip(m.parentTitle(s.ParentID), max(width-8, 8))))
+		b.WriteString(faint.Render(label + clip(m.parentTitle(r.session.ParentID), max(width-8, 8))))
 		b.WriteString("\n")
 	}
 	if s.Missing {
@@ -567,23 +568,24 @@ func (m Model) renderFooter() string {
 	if m.confirming {
 		if r, ok := m.current(); ok {
 			lines = append(lines, warn.Render("delete ")+
-				selected.Render(clip(r.session.Title, 48))+
+				selected.Render(clip(r.display.Title, 48))+
 				warn.Render("?  y / n")+
 				dim.Render("  (moved to trash, not erased)"))
 		}
 	} else if m.searching {
-		lines = append(lines, accent.Render("search ")+selected.Render(m.query)+marker.Render("▌"))
+		lines = append(lines, accent.Render("search ")+selected.Render(scan.SanitizeDisplayText(m.query))+marker.Render("▌"))
 	} else if m.status != "" {
-		lines = append(lines, warn.Render(m.status))
+		lines = append(lines, warn.Render(scan.SanitizeDisplayText(m.status)))
 	}
 
 	var models []string
-	for i, name := range m.models {
+	for i := range m.models {
+		displayName := m.displayModels[i]
 		if i == m.modelIdx {
-			models = append(models, marker.Render("‹ ")+selected.Render(name)+marker.Render(" ›"))
+			models = append(models, marker.Render("‹ ")+selected.Render(displayName)+marker.Render(" ›"))
 			continue
 		}
-		models = append(models, faint.Render(name))
+		models = append(models, faint.Render(displayName))
 	}
 	lines = append(lines, dim.Render("model  ")+strings.Join(models, fill(2)))
 

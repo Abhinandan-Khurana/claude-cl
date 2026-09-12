@@ -383,15 +383,7 @@ func CleanTitle(s string) string {
 		s = re.ReplaceAllString(s, " ")
 	}
 	s = loneTag.ReplaceAllString(s, " ")
-	s = strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' || r == '\r' {
-			return ' '
-		}
-		if unicode.IsControl(r) {
-			return -1
-		}
-		return r
-	}, s)
+	s = SanitizeDisplayText(s)
 	s = strings.Join(strings.Fields(s), " ")
 	return truncate(s, titleMaxLen)
 }
